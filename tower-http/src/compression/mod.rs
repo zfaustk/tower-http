@@ -193,6 +193,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_fused_stream_body_does_not_panic_on_eof() {
+        use futures_util::stream;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        let svc = service_fn(|_req: Request<Body>| async {
+            let body = StreamBody::new(stream::unfold(
+                Some(Bytes::from("Hello, World! ")),
+                |state| async move {
+                    let item = state?;
+                    Some((Ok::<_, Infallible>(Frame::data(item)), None))
+                },
+            ));
+            Ok::<_, Infallible>(Response::new(body))
+        });
+        let mut svc = Compression::new(svc).compress_when(Always);
+
+        let req = Request::builder()
+            .header("accept-encoding", "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        let collected = res.into_body().collect().await.unwrap();
+        let compressed_data = collected.to_bytes();
+
+        let mut decoder = GzDecoder::new(&compressed_data[..]);
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+
+        assert_eq!(decompressed, "Hello, World! ");
+    }
+
+    #[tokio::test]
     async fn zstd_works() {
         let svc = service_fn(handle);
         let mut svc = Compression::new(svc).compress_when(Always);

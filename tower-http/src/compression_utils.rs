@@ -274,6 +274,7 @@ pin_project! {
         body: B,
         yielded_all_data: bool,
         non_data_frame: Option<Frame<B::Data>>,
+        body_eof: bool,
     }
 }
 
@@ -287,6 +288,7 @@ where
             body,
             yielded_all_data: false,
             non_data_frame: None,
+            body_eof: false,
         }
     }
 
@@ -336,6 +338,7 @@ where
                 Some(Err(err)) => return Poll::Ready(Some(Err(err))),
                 None => {
                     *this.yielded_all_data = true;
+                    *this.body_eof = true;
                 }
             }
         }
@@ -366,9 +369,17 @@ where
             return Poll::Ready(Some(Ok(frame)));
         }
 
-        // Yield any remaining frames in the body. There shouldn't be any after the trailers but
-        // you never know.
-        this.body.poll_frame(cx)
+        if *this.body_eof {
+            return Poll::Ready(None);
+        }
+
+        match std::task::ready!(this.body.poll_frame(cx)) {
+            Some(frame) => Poll::Ready(Some(frame)),
+            None => {
+                *this.body_eof = true;
+                Poll::Ready(None)
+            }
+        }
     }
 
     #[inline]
