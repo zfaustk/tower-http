@@ -233,18 +233,29 @@ mod tests {
         use http_body_util::StreamBody;
 
         let svc = service_fn(|_req: Request<Body>| async {
-            let mut trailers = HeaderMap::new();
-            trailers.insert(HeaderName::from_static("foo"), "bar".parse().unwrap());
+            let mut trailers1 = HeaderMap::new();
+            trailers1.insert(
+                HeaderName::from_static("x-trailer-1"),
+                "val1".parse().unwrap(),
+            );
+
+            let mut trailers2 = HeaderMap::new();
+            trailers2.insert(
+                HeaderName::from_static("x-trailer-2"),
+                "val2".parse().unwrap(),
+            );
 
             let body = StreamBody::new(stream::unfold(Some(0), move |state| {
-                let trailers = trailers.clone();
+                let trailers1 = trailers1.clone();
+                let trailers2 = trailers2.clone();
                 async move {
                     match state? {
                         0 => Some((
                             Ok::<_, Infallible>(Frame::data(Bytes::from("Hello, World! "))),
                             Some(1),
                         )),
-                        1 => Some((Ok::<_, Infallible>(Frame::trailers(trailers)), None)),
+                        1 => Some((Ok::<_, Infallible>(Frame::trailers(trailers1)), Some(2))),
+                        2 => Some((Ok::<_, Infallible>(Frame::trailers(trailers2)), None)),
                         _ => None,
                     }
                 }
@@ -259,16 +270,42 @@ mod tests {
             .unwrap();
         let res = svc.ready().await.unwrap().call(req).await.unwrap();
 
-        let collected = res.into_body().collect().await.unwrap();
-        let trailers = collected.trailers().cloned().unwrap();
-        let compressed_data = collected.to_bytes();
+        let body = res.into_body();
+        tokio::pin!(body);
+
+        let mut compressed_data = Vec::new();
+        let mut trailers_list = Vec::new();
+
+        loop {
+            let frame = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await;
+            match frame {
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => compressed_data.extend_from_slice(&data),
+                    Err(frame) => {
+                        if let Ok(trailers) = frame.into_trailers() {
+                            trailers_list.push(trailers);
+                        }
+                    }
+                },
+                Some(Err(err)) => panic!("unexpected error: {:?}", err),
+                None => break,
+            }
+        }
 
         let mut decoder = GzDecoder::new(&compressed_data[..]);
         let mut decompressed = String::new();
         decoder.read_to_string(&mut decompressed).unwrap();
 
         assert_eq!(decompressed, "Hello, World! ");
-        assert_eq!(trailers["foo"], "bar");
+
+        // Both trailer frames must be observed in order
+        assert_eq!(trailers_list.len(), 2);
+        assert_eq!(trailers_list[0]["x-trailer-1"], "val1");
+        assert_eq!(trailers_list[1]["x-trailer-2"], "val2");
+
+        // Subsequent poll must reach terminal None without re-polling the non-fused body
+        let post_eof = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await;
+        assert!(post_eof.is_none());
     }
 
     #[tokio::test]
