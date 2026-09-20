@@ -227,6 +227,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_fused_stream_body_with_trailers_does_not_panic_on_eof() {
+        use futures_util::stream;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+
+        let svc = service_fn(|_req: Request<Body>| async {
+            let mut trailers = HeaderMap::new();
+            trailers.insert(HeaderName::from_static("foo"), "bar".parse().unwrap());
+
+            let body = StreamBody::new(stream::unfold(Some(0), move |state| {
+                let trailers = trailers.clone();
+                async move {
+                    match state? {
+                        0 => Some((
+                            Ok::<_, Infallible>(Frame::data(Bytes::from("Hello, World! "))),
+                            Some(1),
+                        )),
+                        1 => Some((Ok::<_, Infallible>(Frame::trailers(trailers)), None)),
+                        _ => None,
+                    }
+                }
+            }));
+            Ok::<_, Infallible>(Response::new(body))
+        });
+        let mut svc = Compression::new(svc).compress_when(Always);
+
+        let req = Request::builder()
+            .header("accept-encoding", "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let res = svc.ready().await.unwrap().call(req).await.unwrap();
+
+        let collected = res.into_body().collect().await.unwrap();
+        let trailers = collected.trailers().cloned().unwrap();
+        let compressed_data = collected.to_bytes();
+
+        let mut decoder = GzDecoder::new(&compressed_data[..]);
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+
+        assert_eq!(decompressed, "Hello, World! ");
+        assert_eq!(trailers["foo"], "bar");
+    }
+
+    #[tokio::test]
     async fn zstd_works() {
         let svc = service_fn(handle);
         let mut svc = Compression::new(svc).compress_when(Always);
